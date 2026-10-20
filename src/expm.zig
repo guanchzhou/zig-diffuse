@@ -97,14 +97,24 @@ pub fn action(gpa: std.mem.Allocator, a: Csr, t: f64, b: []const f64, out: []f64
             a.mul(term, tmp);
             matvecs += 1;
             const coeff = t / (sf * @as(f64, @floatFromInt(j + 1)));
-            for (term, tmp) |*v, av| v.* = coeff * (av - mu * v.*);
-            const c2 = infNorm(term);
-            for (out, term) |*f, v| f.* += v;
-            if (c1 + c2 <= tol * infNorm(out)) break;
+            var c2: f64 = 0;
+            var out_norm: f64 = 0;
+            for (term, tmp, out) |*v, av, *f| {
+                const nv = coeff * (av - mu * v.*);
+                v.* = nv;
+                c2 = @max(c2, @abs(nv));
+                const nf = f.* + nv;
+                f.* = nf;
+                out_norm = @max(out_norm, @abs(nf));
+            }
+            if (c1 + c2 <= tol * out_norm) break;
             c1 = c2;
         }
-        for (out) |*f| f.* *= eta;
-        @memcpy(term, out);
+        for (out, term) |*f, *v| {
+            const scaled = f.* * eta;
+            f.* = scaled;
+            v.* = scaled;
+        }
     }
     return .{ .m = best_m, .s = best_s, .matvecs = matvecs };
 }

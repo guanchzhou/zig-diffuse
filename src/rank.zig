@@ -57,8 +57,17 @@ pub fn manifold(gpa: std.mem.Allocator, s: Csr, a: f64, y: []const f64, out: []f
 }
 
 fn dot(x: []const f64, y: []const f64) f64 {
-    var sum: f64 = 0;
-    for (x, y) |a, b| sum += a * b;
+    const lanes = 4;
+    const Vec = @Vector(lanes, f64);
+    var acc: Vec = @splat(0.0);
+    var i: usize = 0;
+    while (i + lanes <= x.len) : (i += lanes) {
+        const vx: Vec = x[i..][0..lanes].*;
+        const vy: Vec = y[i..][0..lanes].*;
+        acc = @mulAdd(Vec, vx, vy, acc);
+    }
+    var sum = @reduce(.Add, acc);
+    while (i < x.len) : (i += 1) sum += x[i] * y[i];
     return sum;
 }
 

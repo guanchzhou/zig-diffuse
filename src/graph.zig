@@ -43,28 +43,83 @@ pub fn normalizedAdjacency(gpa: std.mem.Allocator, w: Csr) !Csr {
     const d = try gpa.alloc(f64, w.n);
     defer gpa.free(d);
     degrees(w, d);
-    const list = try w.entries(gpa);
-    defer gpa.free(list);
-    for (list) |*e| {
-        const dd = d[e.row] * d[e.col];
-        e.val = if (dd > 0) e.val / @sqrt(dd) else 0;
+
+    const row_ptr = try gpa.dupe(u32, w.row_ptr);
+    errdefer gpa.free(row_ptr);
+    const col = try gpa.dupe(u32, w.col);
+    errdefer gpa.free(col);
+    const val = try gpa.alloc(f64, w.val.len);
+
+    for (0..w.n) |r| {
+        const dr = d[r];
+        for (w.row_ptr[r]..w.row_ptr[r + 1]) |k| {
+            const dd = dr * d[w.col[k]];
+            val[k] = if (dd > 0) w.val[k] / @sqrt(dd) else 0;
+        }
     }
-    return sparse.fromEntries(gpa, w.n, list, .sum);
+    return .{ .n = w.n, .row_ptr = row_ptr, .col = col, .val = val };
 }
 
 pub fn laplacian(gpa: std.mem.Allocator, w: Csr) !Csr {
-    const s = try normalizedAdjacency(gpa, w);
-    defer s.deinit(gpa);
-    const d = try gpa.alloc(f64, w.n);
+    const n = w.n;
+    const d = try gpa.alloc(f64, n);
     defer gpa.free(d);
     degrees(w, d);
-    var list: std.ArrayList(Entry) = .empty;
-    defer list.deinit(gpa);
-    for (0..w.n) |r| {
-        if (d[r] > 0) try list.append(gpa, .{ .row = @intCast(r), .col = @intCast(r), .val = 1 });
-        for (s.row_ptr[r]..s.row_ptr[r + 1]) |k| try list.append(gpa, .{ .row = @intCast(r), .col = s.col[k], .val = -s.val[k] });
+
+    const row_ptr = try gpa.alloc(u32, n + 1);
+    errdefer gpa.free(row_ptr);
+    row_ptr[0] = 0;
+
+    var total_nnz: usize = 0;
+    for (0..n) |r| {
+        const start = w.row_ptr[r];
+        const end = w.row_ptr[r + 1];
+        var has_diag = false;
+        for (start..end) |k| {
+            if (w.col[k] == r) {
+                has_diag = true;
+                break;
+            }
+        }
+        total_nnz += (end - start) + @intFromBool(d[r] > 0 and !has_diag);
+        row_ptr[r + 1] = @intCast(total_nnz);
     }
-    return sparse.fromEntries(gpa, w.n, list.items, .sum);
+
+    const col = try gpa.alloc(u32, total_nnz);
+    errdefer gpa.free(col);
+    const val = try gpa.alloc(f64, total_nnz);
+
+    var out_k: usize = 0;
+    for (0..n) |r| {
+        const dr = d[r];
+        const r_u32: u32 = @intCast(r);
+        var inserted_diag = !(dr > 0);
+        for (w.row_ptr[r]..w.row_ptr[r + 1]) |k| {
+            const c = w.col[k];
+            if (!inserted_diag and c > r_u32) {
+                col[out_k] = r_u32;
+                val[out_k] = 1.0;
+                out_k += 1;
+                inserted_diag = true;
+            }
+            const dd = dr * d[c];
+            const s_val = if (dd > 0) w.val[k] / @sqrt(dd) else 0;
+            col[out_k] = c;
+            if (c == r_u32) {
+                val[out_k] = (if (dr > 0) @as(f64, 1.0) else @as(f64, 0.0)) - s_val;
+                inserted_diag = true;
+            } else {
+                val[out_k] = -s_val;
+            }
+            out_k += 1;
+        }
+        if (!inserted_diag) {
+            col[out_k] = r_u32;
+            val[out_k] = 1.0;
+            out_k += 1;
+        }
+    }
+    return .{ .n = n, .row_ptr = row_ptr, .col = col, .val = val };
 }
 
 /// Repeated edges i -> j keep the largest weight. Self loops are dropped.
@@ -88,6 +143,21 @@ pub fn advection(gpa: std.mem.Allocator, n: usize, edges: []const Edge) !Csr {
     return sparse.fromEntries(gpa, n, list.items, .sum);
 }
 
+fn vecDot(a: []const f64, b: []const f64) f64 {
+    const lanes = 4;
+    const Vec = @Vector(lanes, f64);
+    var acc: Vec = @splat(0.0);
+    var i: usize = 0;
+    while (i + lanes <= a.len) : (i += lanes) {
+        const va: Vec = a[i..][0..lanes].*;
+        const vb: Vec = b[i..][0..lanes].*;
+        acc = @mulAdd(Vec, va, vb, acc);
+    }
+    var sum = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) sum += a[i] * b[i];
+    return sum;
+}
+
 /// For each of the n vectors (row-major, d values each), an edge to each of its k most
 /// cosine-similar other vectors with a positive similarity, weighted by that similarity. Ties go
 /// to the lower index. Zero vectors get no edges. Pass the result to `symmetric` for the
@@ -95,12 +165,12 @@ pub fn advection(gpa: std.mem.Allocator, n: usize, edges: []const Edge) !Csr {
 pub fn knn(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]Edge {
     std.debug.assert(d > 0 and vectors.len % d == 0);
     const n = vectors.len / d;
+    if (n == 0 or k == 0) return gpa.alloc(Edge, 0);
     const norms = try gpa.alloc(f64, n);
     defer gpa.free(norms);
     for (0..n) |i| {
-        var s: f64 = 0;
-        for (vectors[i * d ..][0..d]) |x| s += x * x;
-        norms[i] = @sqrt(s);
+        const row = vectors[i * d ..][0..d];
+        norms[i] = @sqrt(vecDot(row, row));
     }
     const Cand = struct { j: u32, cos: f64 };
     const cands = try gpa.alloc(Cand, n);
@@ -109,13 +179,15 @@ pub fn knn(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]
     errdefer out.deinit(gpa);
     for (0..n) |i| {
         if (norms[i] == 0) continue;
+        const row_i = vectors[i * d ..][0..d];
         var m: usize = 0;
         for (0..n) |j| {
             if (j == i or norms[j] == 0) continue;
-            var dot: f64 = 0;
-            for (vectors[i * d ..][0..d], vectors[j * d ..][0..d]) |x, y| dot += x * y;
-            const c = dot / (norms[i] * norms[j]);
-            if (c > 0) {
+            const denom = norms[i] * norms[j];
+            if (denom <= 0) continue;
+            const dot = vecDot(row_i, vectors[j * d ..][0..d]);
+            const c = dot / denom;
+            if (c > 0 and std.math.isFinite(c)) {
                 cands[m] = .{ .j = @intCast(j), .cos = c };
                 m += 1;
             }

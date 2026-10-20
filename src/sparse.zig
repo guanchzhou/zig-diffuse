@@ -89,18 +89,79 @@ pub fn fromEntries(gpa: std.mem.Allocator, n: usize, list: []const Entry, merge:
     return .{ .n = n, .row_ptr = row_ptr, .col = col, .val = val };
 }
 
-/// alpha * A + beta * B.
+/// alpha * A + beta * B in linear O(n + nnz(A) + nnz(B)) time via sorted row merge.
 pub fn combine(gpa: std.mem.Allocator, alpha: f64, a: Csr, beta: f64, b: Csr) !Csr {
     std.debug.assert(a.n == b.n);
-    const list = try gpa.alloc(Entry, a.val.len + b.val.len);
-    defer gpa.free(list);
-    const ea = try a.entries(gpa);
-    defer gpa.free(ea);
-    const eb = try b.entries(gpa);
-    defer gpa.free(eb);
-    for (ea, list[0..ea.len]) |e, *o| o.* = .{ .row = e.row, .col = e.col, .val = alpha * e.val };
-    for (eb, list[ea.len..]) |e, *o| o.* = .{ .row = e.row, .col = e.col, .val = beta * e.val };
-    return fromEntries(gpa, a.n, list, .sum);
+    const n = a.n;
+    const row_ptr = try gpa.alloc(u32, n + 1);
+    errdefer gpa.free(row_ptr);
+    row_ptr[0] = 0;
+
+    var total_nnz: usize = 0;
+    for (0..n) |r| {
+        var ia: usize = a.row_ptr[r];
+        const a_end: usize = a.row_ptr[r + 1];
+        var ib: usize = b.row_ptr[r];
+        const b_end: usize = b.row_ptr[r + 1];
+        while (ia < a_end and ib < b_end) {
+            const ca = a.col[ia];
+            const cb = b.col[ib];
+            if (ca < cb) {
+                ia += 1;
+            } else if (cb < ca) {
+                ib += 1;
+            } else {
+                ia += 1;
+                ib += 1;
+            }
+            total_nnz += 1;
+        }
+        total_nnz += (a_end - ia) + (b_end - ib);
+        row_ptr[r + 1] = @intCast(total_nnz);
+    }
+
+    const col = try gpa.alloc(u32, total_nnz);
+    errdefer gpa.free(col);
+    const val = try gpa.alloc(f64, total_nnz);
+
+    var k: usize = 0;
+    for (0..n) |r| {
+        var ia: usize = a.row_ptr[r];
+        const a_end: usize = a.row_ptr[r + 1];
+        var ib: usize = b.row_ptr[r];
+        const b_end: usize = b.row_ptr[r + 1];
+        while (ia < a_end and ib < b_end) {
+            const ca = a.col[ia];
+            const cb = b.col[ib];
+            if (ca < cb) {
+                col[k] = ca;
+                val[k] = alpha * a.val[ia];
+                ia += 1;
+            } else if (cb < ca) {
+                col[k] = cb;
+                val[k] = beta * b.val[ib];
+                ib += 1;
+            } else {
+                col[k] = ca;
+                val[k] = alpha * a.val[ia] + beta * b.val[ib];
+                ia += 1;
+                ib += 1;
+            }
+            k += 1;
+        }
+        while (ia < a_end) : (ia += 1) {
+            col[k] = a.col[ia];
+            val[k] = alpha * a.val[ia];
+            k += 1;
+        }
+        while (ib < b_end) : (ib += 1) {
+            col[k] = b.col[ib];
+            val[k] = beta * b.val[ib];
+            k += 1;
+        }
+    }
+
+    return .{ .n = n, .row_ptr = row_ptr, .col = col, .val = val };
 }
 
 test "fromEntries merges duplicates and multiplies" {
