@@ -67,7 +67,7 @@ fn diffusion(_: void, smith: *Smith) anyerror!void {
     defer l_sym.deinit(gpa);
     _ = try expm.action(gpa, l_sym, -t, x[0..n], out[0..n]);
     var d: [max_n]f64 = undefined;
-    graph.degrees(w, d[0..n]);
+    try graph.degrees(w, d[0..n]);
     var before: f64 = 0;
     var after: f64 = 0;
     for (d[0..n], x[0..n], out[0..n]) |dv, xv, ov| {

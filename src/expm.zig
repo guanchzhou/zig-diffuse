@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const Csr = @import("sparse.zig").Csr;
+const unchecked = @import("unchecked.zig");
 
 const theta = [_]struct { m: u32, t: f64 }{
     .{ .m = 1, .t = 2.29e-16 }, .{ .m = 2, .t = 2.58e-8 },  .{ .m = 3, .t = 1.39e-5 },  .{ .m = 4, .t = 3.40e-4 },
@@ -30,7 +31,7 @@ const max_steps = 1 << 24;
 
 pub const Stats = struct { m: u32, s: u64, matvecs: u64 };
 
-pub const Error = error{ OutOfMemory, NormTooLarge };
+pub const Error = error{ OutOfMemory, NormTooLarge, InvalidCsr, LengthMismatch };
 
 fn infNorm(x: []const f64) f64 {
     var m: f64 = 0;
@@ -58,11 +59,12 @@ fn shiftedNorm1(gpa: std.mem.Allocator, a: Csr, mu: f64) !f64 {
 
 /// out = exp(tA) b. `out` may not alias `b`.
 pub fn action(gpa: std.mem.Allocator, a: Csr, t: f64, b: []const f64, out: []f64) Error!Stats {
+    try a.validate();
     const n = a.n;
-    std.debug.assert(b.len == n and out.len == n);
+    if (b.len != n or out.len != n) return error.LengthMismatch;
     @memcpy(out, b);
     if (n == 0) return .{ .m = 0, .s = 1, .matvecs = 0 };
-    const mu = a.trace() / @as(f64, @floatFromInt(n));
+    const mu = unchecked.trace(a) / @as(f64, @floatFromInt(n));
     const norm = @abs(t) * try shiftedNorm1(gpa, a, mu);
     if (norm == 0) {
         const e = @exp(t * mu);
@@ -94,7 +96,7 @@ pub fn action(gpa: std.mem.Allocator, a: Csr, t: f64, b: []const f64, out: []f64
     for (0..best_s) |_| {
         var c1 = infNorm(term);
         for (0..best_m) |j| {
-            a.mul(term, tmp);
+            unchecked.mul(a, term, tmp);
             matvecs += 1;
             const coeff = t / (sf * @as(f64, @floatFromInt(j + 1)));
             var c2: f64 = 0;
@@ -156,4 +158,18 @@ test "zero matrix and t = 0" {
     const st = try action(gpa, a, 5, &.{ 3, 4 }, &out);
     try std.testing.expectEqual(@as(u64, 0), st.matvecs);
     try std.testing.expectEqualSlices(f64, &.{ 3, 4 }, &out);
+}
+
+test "rejects a malformed matrix and mismatched vectors" {
+    const gpa = std.testing.allocator;
+    var row_ptr = [_]u32{ 0, 2 };
+    var col = [_]u32{ 0, 0 };
+    var val = [_]f64{ 1, 1 };
+    const ok: Csr = .{ .n = 1, .row_ptr = &row_ptr, .col = &col, .val = &val };
+    var bad = ok;
+    bad.col = col[0..1];
+    var out: [1]f64 = undefined;
+    try std.testing.expectError(error.InvalidCsr, action(gpa, bad, 1, &.{1}, &out));
+    try std.testing.expectError(error.LengthMismatch, action(gpa, ok, 1, &.{ 1, 2 }, &out));
+    try std.testing.expectError(error.LengthMismatch, action(gpa, ok, 1, &.{1}, out[0..0]));
 }

@@ -12,16 +12,25 @@
 
 const std = @import("std");
 const sparse = @import("sparse.zig");
+const unchecked = @import("unchecked.zig");
 const Csr = sparse.Csr;
 const Entry = sparse.Entry;
 
 pub const Edge = struct { from: u32, to: u32, weight: f64 = 1 };
 
+fn checkEdges(n: usize, edges: []const Edge) error{ NodeOutOfRange, InvalidWeight }!void {
+    for (edges) |e| {
+        if (e.from >= n or e.to >= n) return error.NodeOutOfRange;
+        if (!(e.weight >= 0)) return error.InvalidWeight;
+    }
+}
+
+/// Weights must be non-negative and not NaN.
 pub fn symmetric(gpa: std.mem.Allocator, n: usize, edges: []const Edge) !Csr {
+    try checkEdges(n, edges);
     var list: std.ArrayList(Entry) = .empty;
     defer list.deinit(gpa);
     for (edges) |e| {
-        std.debug.assert(e.from < n and e.to < n and e.weight >= 0);
         if (e.from == e.to) continue;
         try list.append(gpa, .{ .row = e.from, .col = e.to, .val = e.weight });
         try list.append(gpa, .{ .row = e.to, .col = e.from, .val = e.weight });
@@ -30,19 +39,17 @@ pub fn symmetric(gpa: std.mem.Allocator, n: usize, edges: []const Edge) !Csr {
 }
 
 /// Row sums of W.
-pub fn degrees(w: Csr, out: []f64) void {
-    std.debug.assert(out.len == w.n);
-    for (0..w.n) |r| {
-        var d: f64 = 0;
-        for (w.row_ptr[r]..w.row_ptr[r + 1]) |k| d += w.val[k];
-        out[r] = d;
-    }
+pub fn degrees(w: Csr, out: []f64) error{ InvalidCsr, LengthMismatch }!void {
+    try w.validate();
+    if (out.len != w.n) return error.LengthMismatch;
+    unchecked.rowSums(w, out);
 }
 
 pub fn normalizedAdjacency(gpa: std.mem.Allocator, w: Csr) !Csr {
+    try w.validate();
     const d = try gpa.alloc(f64, w.n);
     defer gpa.free(d);
-    degrees(w, d);
+    unchecked.rowSums(w, d);
 
     const row_ptr = try gpa.dupe(u32, w.row_ptr);
     errdefer gpa.free(row_ptr);
@@ -61,10 +68,11 @@ pub fn normalizedAdjacency(gpa: std.mem.Allocator, w: Csr) !Csr {
 }
 
 pub fn laplacian(gpa: std.mem.Allocator, w: Csr) !Csr {
+    try w.validate();
     const n = w.n;
     const d = try gpa.alloc(f64, n);
     defer gpa.free(d);
-    degrees(w, d);
+    unchecked.rowSums(w, d);
 
     const row_ptr = try gpa.alloc(u32, n + 1);
     errdefer gpa.free(row_ptr);
@@ -82,6 +90,7 @@ pub fn laplacian(gpa: std.mem.Allocator, w: Csr) !Csr {
             }
         }
         total_nnz += (end - start) + @intFromBool(d[r] > 0 and !has_diag);
+        if (total_nnz > std.math.maxInt(u32)) return error.TooManyNonzeros;
         row_ptr[r + 1] = @intCast(total_nnz);
     }
 
@@ -122,12 +131,13 @@ pub fn laplacian(gpa: std.mem.Allocator, w: Csr) !Csr {
     return .{ .n = n, .row_ptr = row_ptr, .col = col, .val = val };
 }
 
-/// Repeated edges i -> j keep the largest weight. Self loops are dropped.
+/// Repeated edges i -> j keep the largest weight. Self loops are dropped. Weights must be
+/// non-negative and not NaN.
 pub fn advection(gpa: std.mem.Allocator, n: usize, edges: []const Edge) !Csr {
+    try checkEdges(n, edges);
     var direct: std.ArrayList(Entry) = .empty;
     defer direct.deinit(gpa);
     for (edges) |e| {
-        std.debug.assert(e.from < n and e.to < n and e.weight >= 0);
         if (e.from != e.to) try direct.append(gpa, .{ .row = e.from, .col = e.to, .val = e.weight });
     }
     const a = try sparse.fromEntries(gpa, n, direct.items, .max);
@@ -158,13 +168,43 @@ fn vecDot(a: []const f64, b: []const f64) f64 {
     return sum;
 }
 
-/// For each of the n vectors (row-major, d values each), an edge to each of its k most
+const Cand = struct { j: u32, cos: f64 };
+
+fn better(_: void, x: Cand, y: Cand) bool {
+    return x.cos > y.cos or (x.cos == y.cos and x.j < y.j);
+}
+
+/// A binary heap with the worst candidate at the root.
+fn siftDown(h: []Cand, start: usize) void {
+    var i = start;
+    while (true) {
+        const l = 2 * i + 1;
+        if (l >= h.len) return;
+        const w = if (l + 1 < h.len and better({}, h[l], h[l + 1])) l + 1 else l;
+        if (!better({}, h[i], h[w])) return;
+        std.mem.swap(Cand, &h[i], &h[w]);
+        i = w;
+    }
+}
+
+fn siftUp(h: []Cand, start: usize) void {
+    var i = start;
+    while (i > 0) {
+        const p = (i - 1) / 2;
+        if (!better({}, h[p], h[i])) return;
+        std.mem.swap(Cand, &h[p], &h[i]);
+        i = p;
+    }
+}
+
+/// For each of the n vectors (row-major, d values each, d > 0), an edge to each of its k most
 /// cosine-similar other vectors with a positive similarity, weighted by that similarity. Ties go
 /// to the lower index. Zero vectors get no edges. Pass the result to `symmetric` for the
 /// undirected graph. Caller owns the returned slice.
 pub fn knn(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]Edge {
-    std.debug.assert(d > 0 and vectors.len % d == 0);
+    if (d == 0 or vectors.len % d != 0) return error.LengthMismatch;
     const n = vectors.len / d;
+    if (n > 0 and n - 1 > std.math.maxInt(u32)) return error.TooManyNodes;
     if (n == 0 or k == 0) return gpa.alloc(Edge, 0);
     const norms = try gpa.alloc(f64, n);
     defer gpa.free(norms);
@@ -172,9 +212,8 @@ pub fn knn(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]
         const row = vectors[i * d ..][0..d];
         norms[i] = @sqrt(vecDot(row, row));
     }
-    const Cand = struct { j: u32, cos: f64 };
-    const cands = try gpa.alloc(Cand, n);
-    defer gpa.free(cands);
+    const heap = try gpa.alloc(Cand, @min(k, n));
+    defer gpa.free(heap);
     var out: std.ArrayList(Edge) = .empty;
     errdefer out.deinit(gpa);
     for (0..n) |i| {
@@ -187,17 +226,19 @@ pub fn knn(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]
             if (denom <= 0) continue;
             const dot = vecDot(row_i, vectors[j * d ..][0..d]);
             const c = dot / denom;
-            if (c > 0 and std.math.isFinite(c)) {
-                cands[m] = .{ .j = @intCast(j), .cos = c };
+            if (!(c > 0 and std.math.isFinite(c))) continue;
+            const cand: Cand = .{ .j = @intCast(j), .cos = c };
+            if (m < heap.len) {
+                heap[m] = cand;
                 m += 1;
+                siftUp(heap[0..m], m - 1);
+            } else if (better({}, cand, heap[0])) {
+                heap[0] = cand;
+                siftDown(heap[0..m], 0);
             }
         }
-        std.mem.sort(Cand, cands[0..m], {}, struct {
-            fn f(_: void, x: Cand, y: Cand) bool {
-                return x.cos > y.cos or (x.cos == y.cos and x.j < y.j);
-            }
-        }.f);
-        for (cands[0..@min(k, m)]) |c| try out.append(gpa, .{ .from = @intCast(i), .to = c.j, .weight = c.cos });
+        std.mem.sort(Cand, heap[0..m], {}, better);
+        for (heap[0..m]) |c| try out.append(gpa, .{ .from = @intCast(i), .to = c.j, .weight = c.cos });
     }
     return out.toOwnedSlice(gpa);
 }
@@ -210,7 +251,7 @@ test "laplacian of a path, with an isolated node" {
     defer l.deinit(gpa);
     var y: [4]f64 = undefined;
     // The kernel of L is spanned by D^(1/2) 1 on the connected part.
-    l.mul(&.{ 1, @sqrt(2.0), 1, 7 }, &y);
+    try l.mul(&.{ 1, @sqrt(2.0), 1, 7 }, &y);
     for (y) |v| try std.testing.expectApproxEqAbs(@as(f64, 0), v, 1e-15);
 }
 
@@ -219,7 +260,7 @@ test "advection conserves mass" {
     const l = try advection(gpa, 3, &.{ .{ .from = 0, .to = 1, .weight = 2 }, .{ .from = 0, .to = 2 }, .{ .from = 1, .to = 2 } });
     defer l.deinit(gpa);
     var y: [3]f64 = undefined;
-    l.mul(&.{ 1, 2, 3 }, &y);
+    try l.mul(&.{ 1, 2, 3 }, &y);
     try std.testing.expectEqualSlices(f64, &.{ 3, 0, -3 }, &y);
 }
 
@@ -231,4 +272,90 @@ test "knn keeps the k most similar, ties to the lower index" {
     try std.testing.expectEqual(@as(u32, 1), e[0].to);
     try std.testing.expectEqual(@as(u32, 0), e[1].to);
     try std.testing.expectEqual(@as(u32, 0), e[2].to);
+}
+
+test "edge lists with an out-of-range node or a bad weight are rejected" {
+    const gpa = std.testing.allocator;
+    const nan = std.math.nan(f64);
+    try std.testing.expectError(error.NodeOutOfRange, symmetric(gpa, 2, &.{.{ .from = 0, .to = 2 }}));
+    try std.testing.expectError(error.NodeOutOfRange, symmetric(gpa, 2, &.{.{ .from = 2, .to = 2 }}));
+    try std.testing.expectError(error.InvalidWeight, symmetric(gpa, 2, &.{.{ .from = 0, .to = 1, .weight = -1 }}));
+    try std.testing.expectError(error.InvalidWeight, symmetric(gpa, 2, &.{.{ .from = 0, .to = 1, .weight = nan }}));
+    try std.testing.expectError(error.NodeOutOfRange, advection(gpa, 2, &.{.{ .from = 3, .to = 0 }}));
+    try std.testing.expectError(error.InvalidWeight, advection(gpa, 2, &.{.{ .from = 0, .to = 1, .weight = nan }}));
+    try std.testing.expectError(error.InvalidWeight, advection(gpa, 2, &.{.{ .from = 1, .to = 1, .weight = -0.5 }}));
+}
+
+test "operators reject a malformed matrix and a short degree slice" {
+    const gpa = std.testing.allocator;
+    var row_ptr = [_]u32{ 0, 1, 1 };
+    var col = [_]u32{5};
+    var val = [_]f64{1};
+    const bad: Csr = .{ .n = 2, .row_ptr = &row_ptr, .col = &col, .val = &val };
+    var d: [2]f64 = undefined;
+    try std.testing.expectError(error.InvalidCsr, degrees(bad, &d));
+    try std.testing.expectError(error.InvalidCsr, normalizedAdjacency(gpa, bad));
+    try std.testing.expectError(error.InvalidCsr, laplacian(gpa, bad));
+
+    const w = try symmetric(gpa, 2, &.{.{ .from = 0, .to = 1 }});
+    defer w.deinit(gpa);
+    try std.testing.expectError(error.LengthMismatch, degrees(w, d[0..1]));
+}
+
+test "knn rejects a zero or non-dividing dimension" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.LengthMismatch, knn(gpa, &.{ 1, 2 }, 0, 1));
+    try std.testing.expectError(error.LengthMismatch, knn(gpa, &.{ 1, 2, 3 }, 2, 1));
+}
+
+fn knnBySort(gpa: std.mem.Allocator, vectors: []const f64, d: usize, k: usize) ![]Edge {
+    const n = vectors.len / d;
+    if (n == 0 or k == 0) return gpa.alloc(Edge, 0);
+    const norms = try gpa.alloc(f64, n);
+    defer gpa.free(norms);
+    for (0..n) |i| {
+        const row = vectors[i * d ..][0..d];
+        norms[i] = @sqrt(vecDot(row, row));
+    }
+    const cands = try gpa.alloc(Cand, n);
+    defer gpa.free(cands);
+    var out: std.ArrayList(Edge) = .empty;
+    errdefer out.deinit(gpa);
+    for (0..n) |i| {
+        if (norms[i] == 0) continue;
+        const row_i = vectors[i * d ..][0..d];
+        var m: usize = 0;
+        for (0..n) |j| {
+            if (j == i or norms[j] == 0) continue;
+            const denom = norms[i] * norms[j];
+            if (denom <= 0) continue;
+            const c = vecDot(row_i, vectors[j * d ..][0..d]) / denom;
+            if (c > 0 and std.math.isFinite(c)) {
+                cands[m] = .{ .j = @intCast(j), .cos = c };
+                m += 1;
+            }
+        }
+        std.mem.sort(Cand, cands[0..m], {}, better);
+        for (cands[0..@min(k, m)]) |c| try out.append(gpa, .{ .from = @intCast(i), .to = c.j, .weight = c.cos });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "knn with a heap matches a full sort, ties included" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6b6e6e);
+    const random = prng.random();
+    var vectors: [60 * 3]f64 = undefined;
+    for (0..200) |_| {
+        const d = random.intRangeAtMost(usize, 1, 3);
+        const n = random.intRangeAtMost(usize, 0, 60);
+        // Small integer coordinates make exact cosine ties and zero vectors common.
+        for (vectors[0 .. n * d]) |*v| v.* = @floatFromInt(random.intRangeAtMost(i8, -2, 2));
+        const k = random.intRangeAtMost(usize, 0, n + 2);
+        const got = try knn(gpa, vectors[0 .. n * d], d, k);
+        defer gpa.free(got);
+        const want = try knnBySort(gpa, vectors[0 .. n * d], d, k);
+        defer gpa.free(want);
+        try std.testing.expectEqualSlices(Edge, want, got);
+    }
 }

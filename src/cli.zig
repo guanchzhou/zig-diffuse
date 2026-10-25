@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 
     var in_buf: [64 * 1024]u8 = undefined;
     var stdin = std.Io.File.stdin().readerStreaming(init.io, &in_buf);
-    const text = stdin.interface.allocRemaining(arena, .unlimited) catch |e| switch (e) {
+    const text = stdin.interface.allocRemaining(arena, .limited(256 * 1024 * 1024)) catch |e| switch (e) {
         error.ReadFailed => return stdin.err.?,
         else => |x| return x,
     };
@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
         if (in.scores) |sc| {
             checkLen("scores", sc.len, n);
             const blended = try arena.alloc(f64, n);
-            diffuse.rank.blend(sc, f, in.beta, blended);
+            try diffuse.rank.blend(sc, f, in.beta, blended);
             try emit(out, .{ .f = f, .iterations = iterations, .scores = blended });
         } else try emit(out, .{ .f = f, .iterations = iterations });
     } else if (std.mem.eql(u8, cmd, "expm")) {

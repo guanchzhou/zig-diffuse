@@ -112,7 +112,7 @@ test "manifold ranking matches brute-force knn and a direct solve" {
         _ = try diffuse.rank.manifold(arena, s, c.a, c.y, f, .{});
         try expectClose(c.f, f);
         const blended = try arena.alloc(f64, n);
-        diffuse.rank.blend(c.s, f, c.beta, blended);
+        try diffuse.rank.blend(c.s, f, c.beta, blended);
         try expectClose(c.blended, blended);
     }
 }
